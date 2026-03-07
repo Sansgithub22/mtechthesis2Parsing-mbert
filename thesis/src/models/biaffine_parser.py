@@ -15,7 +15,7 @@ Reference:
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from models.encoder import BERTEncoder
 
 
