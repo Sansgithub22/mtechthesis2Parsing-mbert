@@ -46,21 +46,24 @@ class DependencyDataset(Dataset):
         """
         Tokenize a sentence and build alignment between wordpieces and words.
         Returns None if sentence is too long.
+
+        A virtual ROOT token is prepended at position 0 (mapped to [CLS]).
+        UD head values (0=root, 1..N=1-indexed words) then correctly index
+        into tensor positions 0..N, eliminating out-of-bounds errors.
         """
         words = [t.form for t in sentence]
-        heads = [t.head for t in sentence]
-        rels = [self.rel_vocab.get(t.deprel, 0) for t in sentence]
+        heads_raw = [t.head for t in sentence]   # UD: 0=root, 1..N (1-indexed)
+        rels_raw = [self.rel_vocab.get(t.deprel, 0) for t in sentence]
 
         # Tokenize each word separately to track which wordpieces belong to which word
-        # We build the full sequence manually to get exact piece-to-word mapping
         all_pieces = []
-        word_starts = []   # index of first wordpiece for each word (offset by 1 for [CLS])
+        word_starts_real = []  # index of first wordpiece for each word (offset by 1 for [CLS])
 
         for word in words:
             pieces = self.tokenizer.tokenize(word)
             if not pieces:
                 pieces = [self.tokenizer.unk_token]
-            word_starts.append(len(all_pieces) + 1)  # +1 for [CLS]
+            word_starts_real.append(len(all_pieces) + 1)  # +1 for [CLS]
             all_pieces.extend(pieces)
 
         # Build full sequence: [CLS] + all_pieces + [SEP]
@@ -77,12 +80,21 @@ class DependencyDataset(Dataset):
         input_ids = [cls_id] + piece_ids + [sep_id]
         attention_mask = [1] * len(input_ids)
 
+        # Prepend virtual ROOT at position 0 (mapped to [CLS] token at index 0).
+        # Root's own head/rel are padding values — they are masked out in loss/eval.
+        word_starts = [0] + word_starts_real
+        heads = [0] + heads_raw
+        rels = [0] + rels_raw
+        # is_real_word: 0 for root, 1 for actual words (controls loss/eval mask)
+        is_real_word = [0] + [1] * len(sentence)
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "word_starts": word_starts,
             "heads": heads,
             "rels": rels,
+            "is_real_word": is_real_word,
         }
 
     def __len__(self):
@@ -115,7 +127,7 @@ def collate_fn(batch: List[dict], pad_token_id: int = 0) -> dict:
 
     for x in batch:
         seq_len = len(x["input_ids"])
-        n_words = len(x["heads"])
+        n_words = len(x["heads"])  # includes root at position 0
 
         input_ids_padded.append(x["input_ids"] + [pad_token_id] * (max_seq - seq_len))
         attention_mask_padded.append(x["attention_mask"] + [0] * (max_seq - seq_len))
@@ -124,7 +136,8 @@ def collate_fn(batch: List[dict], pad_token_id: int = 0) -> dict:
         word_starts_padded.append(x["word_starts"] + [0] * (max_words - n_words))
         heads_padded.append(x["heads"] + [0] * (max_words - n_words))
         rels_padded.append(x["rels"] + [0] * (max_words - n_words))
-        word_mask.append([1] * n_words + [0] * (max_words - n_words))
+        # word_mask: 1 for real words only (NOT root, NOT padding) — used for loss/eval
+        word_mask.append(x["is_real_word"] + [0] * (max_words - n_words))
 
     return {
         "input_ids": torch.tensor(input_ids_padded, dtype=torch.long),

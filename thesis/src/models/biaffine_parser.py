@@ -218,10 +218,13 @@ class BiaffineParser(nn.Module):
         """
         batch, n_words, _ = s_arc.shape
 
-        # Mask padding positions: set their arc scores to -inf so they don't
-        # contribute to the softmax denominator in a meaningful way
-        # [batch, 1, n_words] -> broadcast to [batch, n_words, n_words]
-        head_mask = word_mask.unsqueeze(1).expand_as(s_arc)
+        # Valid head positions = root (position 0) + real words.
+        # Padding positions should be masked to -inf in the head dimension.
+        # word_mask is True only for real words (not root, not padding).
+        # We must keep root (position 0) as a valid head target.
+        valid_head = word_mask.clone()
+        valid_head[:, 0] = True  # root is always a valid head
+        head_mask = valid_head.unsqueeze(1).expand_as(s_arc)
         s_arc = s_arc.masked_fill(~head_mask, float("-inf"))
 
         # Arc loss: cross-entropy over head positions for each word
@@ -280,19 +283,21 @@ class BiaffineParser(nn.Module):
         pred_rels = []
 
         for b in range(batch):
-            mask = word_mask[b]  # [n_words] boolean
-            n = mask.sum().item()
+            mask = word_mask[b]  # [n_words]: 1 for real words, 0 for root/padding
+            n = mask.sum().item()  # number of real words
 
-            # Arc scores for valid words: [n, n]
-            arc_scores = s_arc[b, :n, :n].cpu().numpy()
+            # Tensor layout: position 0 = root, positions 1..n = real words.
+            # Dependents: real words at positions 1..n  -> rows 1:n+1
+            # Heads: root + real words at positions 0..n -> cols 0:n+1
+            arc_scores = s_arc[b, 1:n+1, :n+1].cpu().numpy()  # [n, n+1]
 
-            # Decode MST (Chu-Liu/Edmonds)
-            h = mst_decode(arc_scores)  # list of head indices, 0-based
+            # Decode MST: returns head indices in 0..n (0=root)
+            h = mst_decode(arc_scores)  # list of n head indices
 
             pred_heads.append(h)
 
-            # Pick relation at predicted head
-            rel_scores = s_rel[b, :n, :, :]  # [n, n_words, n_rels]
+            # Pick relation at predicted head for each real word
+            rel_scores = s_rel[b, 1:n+1, :n+1, :]  # [n, n+1, n_rels]
             h_tensor = torch.tensor(h, device=s_rel.device)
             # Gather at predicted head: [n, n_rels]
             rel_at_pred = rel_scores[torch.arange(n), h_tensor]
@@ -308,26 +313,24 @@ class BiaffineParser(nn.Module):
 
 def mst_decode(scores: np.ndarray) -> list:
     """
-    Decode the maximum spanning tree rooted at node 0.
-
-    Uses a simple greedy argmax + cycle-breaking approach, which is a
-    close approximation of Edmonds' algorithm for most practical cases.
-    For a thesis, you can replace this with a full Edmonds implementation.
+    Greedy maximum spanning tree decoder.
 
     Args:
-        scores: [n, n] float array where scores[i, j] = score of arc i->j
-                (i is head, j is dependent). Node 0 is the artificial root.
+        scores: [n_dep, n_head] float array where scores[i, j] = score of
+                dependent word i having head j. n_head = n_dep + 1 because
+                position 0 is the virtual root (root column included).
 
     Returns:
-        heads: list of length n where heads[i] = predicted head of word i+1.
-               Values are 0-based (0 = root node).
+        heads: list of n_dep ints, each in 0..n_dep (0 = root).
     """
-    n = scores.shape[0]
-    # scores[i, j] = score of word i being head of word j
-    # For each dependent (column), pick the highest-scoring head (row)
-    # Disallow self-loops
-    np.fill_diagonal(scores, float("-inf"))
+    scores = scores.copy()
+    n_dep, n_head = scores.shape
 
-    # Greedy argmax
-    heads = scores.argmax(axis=0).tolist()  # heads[j] = argmax_i scores[i, j]
+    # Disallow self-loops: dependent i is at tensor position i+1, so head i+1
+    for i in range(n_dep):
+        if i + 1 < n_head:
+            scores[i, i + 1] = float("-inf")
+
+    # Greedy argmax: for each dependent, pick best head
+    heads = scores.argmax(axis=1).tolist()  # heads[i] = argmax_j scores[i,j]
     return heads
